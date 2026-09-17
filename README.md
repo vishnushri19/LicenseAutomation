@@ -76,9 +76,11 @@ BIG-IP get_dossier
   -> verify /mgmt/tm/sys/license
 ```
 
-The public F5 service uses the `getEULA` and `activate` SOAP operations. Its
-Axis RPC responses may contain `href`/`multiRef` references; the client
-resolves those references before extracting the EULA and signed license.
+The public F5 service currently publishes an Apache Axis `getLicense` SOAP
+operation. Its RPC responses may contain `href`/`multiRef` references; the
+client resolves those references before extracting the EULA and signed
+license. This follows the same two-step sequence described in K000161807:
+request the EULA, then submit the accepted EULA to receive the signed license.
 
 The BIG-IP client attempts token authentication through
 `/mgmt/shared/authn/login` and falls back to Basic authentication if token

@@ -23,6 +23,8 @@ ACTIVATION_URL = (
     )
     + "urn:com.f5.license.v5b.ActivationService"
 )
+SOAP_NAMESPACE = "http://v5b.license.f5.com"
+SOAP_ENCODING = "http://schemas.xmlsoap.org/soap/encoding/"
 
 
 class BigIPClient:
@@ -218,7 +220,6 @@ def _multi_ref_values(root: ET.Element, names: set[str]) -> list[str]:
 
 
 def soap_request(
-    action: str,
     body: str,
     verify_tls: bool,
     timeout: int,
@@ -227,7 +228,9 @@ def soap_request(
         '<?xml version="1.0" encoding="UTF-8"?>'
         '<soapenv:Envelope '
         'xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" '
-        'xmlns:act="urn:com.f5.license.v5b.ActivationService">'
+        f'xmlns:soapenc="{SOAP_ENCODING}" '
+        'xmlns:xsd="http://www.w3.org/2001/XMLSchema" '
+        'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">'
         "<soapenv:Body>"
         f"{body}"
         "</soapenv:Body>"
@@ -238,10 +241,7 @@ def soap_request(
         data=envelope.encode("utf-8"),
         headers={
             "Content-Type": "text/xml; charset=utf-8",
-            "SOAPAction": (
-                "urn:com.f5.license.v5b.ActivationService#"
-                f"{action}"
-            ),
+            "SOAPAction": '""',
         },
         verify=verify_tls,
         timeout=timeout,
@@ -289,66 +289,42 @@ def text_candidates(root: ET.Element) -> Iterable[str]:
             yield text
 
 
-def get_eula(
+def get_license_transaction(
     dossier: str,
+    eula: str,
+    fields: dict[str, str],
     verify_tls: bool,
     timeout: int,
-) -> str:
+) -> dict[str, str]:
+    values = {"dossier": dossier, "eula": eula, **fields}
+    names = (
+        "dossier", "eula", "email", "firstName", "lastName",
+        "companyName", "phone", "jobTitle", "address", "city",
+        "stateProvince", "postalCode", "country",
+    )
+    arguments = "".join(
+        f'<{name} xsi:type="xsd:string">'
+        f'{html.escape(values.get(name, ""))}</{name}>'
+        for name in names
+    )
     response = soap_request(
-        "getEULA",
-        (
-            "<act:getEULA><dossier>"
-            f"{html.escape(dossier)}"
-            "</dossier></act:getEULA>"
-        ),
+        f'<getLicense xmlns="{SOAP_NAMESPACE}" '
+        f'encodingStyle="{SOAP_ENCODING}">{arguments}</getLicense>',
         verify_tls,
         timeout,
     )
     raise_for_soap_fault(response)
     root = parse_xml(response)
-    values = _multi_ref_values(root, {"eula", "eulareturn"})
-    if not values:
-        values = list(text_candidates(root))
-    eula = max(values, key=len, default="")
-    if not eula:
-        raise RuntimeError("F5 Activation Service returned no EULA text.")
-    return eula
-
-
-def activate(
-    dossier: str,
-    verify_tls: bool,
-    timeout: int,
-) -> str:
-    response = soap_request(
-        "activate",
-        (
-            "<act:activate><dossier>"
-            f"{html.escape(dossier)}"
-            "</dossier><eula_accepted>true</eula_accepted>"
-            "</act:activate>"
-        ),
-        verify_tls,
-        timeout,
-    )
-    raise_for_soap_fault(response)
-    root = parse_xml(response)
-    candidates = _multi_ref_values(
-        root,
-        {"license", "licensetext", "licensefile", "licensereturn"},
-    )
-    if not candidates:
-        candidates = [
-            value
-            for value in text_candidates(root)
-            if "license" in value.lower()
-        ]
-    license_text = max(candidates, key=len, default="")
-    if not license_text:
+    result: dict[str, str] = {}
+    for name in ("eula", "license", "state", "faulttext"):
+        values = _multi_ref_values(root, {name})
+        if values:
+            result[name] = max(values, key=len)
+    if result.get("faulttext"):
         raise RuntimeError(
-            "F5 Activation Service returned no signed license text."
+            f"F5 Activation Service fault: {result['faulttext']}"
         )
-    return license_text
+    return result
 
 
 def generate_dossier(client: BigIPClient, registration_key: str) -> str:
@@ -441,8 +417,28 @@ def main() -> int:
             )
             return 0
 
+        fields = {
+            "email": os.getenv("F5_LICENSE_EMAIL", ""),
+            "firstName": os.getenv("F5_LICENSE_FIRST_NAME", ""),
+            "lastName": os.getenv("F5_LICENSE_LAST_NAME", ""),
+            "companyName": os.getenv("F5_LICENSE_COMPANY", ""),
+            "phone": os.getenv("F5_LICENSE_PHONE", ""),
+            "jobTitle": os.getenv("F5_LICENSE_JOB_TITLE", ""),
+            "address": os.getenv("F5_LICENSE_ADDRESS", ""),
+            "city": os.getenv("F5_LICENSE_CITY", ""),
+            "stateProvince": os.getenv("F5_LICENSE_STATE", ""),
+            "postalCode": os.getenv("F5_LICENSE_POSTAL_CODE", ""),
+            "country": os.getenv("F5_LICENSE_COUNTRY", ""),
+        }
         print("Requesting EULA from F5 Activation Service...")
-        eula = get_eula(dossier, args.verify_tls, timeout)
+        transaction = get_license_transaction(
+            dossier, "", fields, args.verify_tls, timeout
+        )
+        eula = transaction.get("eula", "")
+        if not eula:
+            raise RuntimeError(
+                "F5 Activation Service returned no EULA text."
+            )
         print(f"EULA received ({len(eula)} characters).")
         if not sys.stdin.isatty():
             raise RuntimeError(
@@ -456,7 +452,14 @@ def main() -> int:
             return 0
 
         print("Activating through F5 Activation Service...")
-        license_text = activate(dossier, args.verify_tls, timeout)
+        transaction = get_license_transaction(
+            dossier, eula, fields, args.verify_tls, timeout
+        )
+        license_text = transaction.get("license", "")
+        if not license_text:
+            raise RuntimeError(
+                "F5 Activation Service returned no signed license text."
+            )
         print("Signed license received. Applying license to BIG-IP...")
         apply_license(client, license_text)
         verify_license(client, registration_key)
