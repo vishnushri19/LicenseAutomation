@@ -53,9 +53,33 @@ class BigIPClient:
             timeout=self.timeout,
         )
         if response.ok:
-            token = response.json().get("token", {}).get("token")
+            try:
+                payload = response.json()
+            except ValueError:
+                return
+            token = payload.get("token", {}).get("token")
             if token:
                 self.token = str(token)
+
+    @staticmethod
+    def _json_response(response: requests.Response, path: str) -> dict:
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            content_type = response.headers.get("Content-Type", "unknown")
+            preview = " ".join(response.text.split())
+            if len(preview) > 240:
+                preview = preview[:240] + "..."
+            raise RuntimeError(
+                "BIG-IP returned a non-JSON response from "
+                f"{path}: status={response.status_code}, "
+                f"content_type={content_type}, response={preview or '<empty>'}"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError(
+                f"BIG-IP returned an unexpected JSON response from {path}."
+            )
+        return payload
 
     def post(
         self,
@@ -73,7 +97,7 @@ class BigIPClient:
             timeout=timeout or self.timeout,
         )
         response.raise_for_status()
-        return response.json()
+        return self._json_response(response, path)
 
     def get(self, path: str) -> dict:
         headers = {"X-F5-Auth-Token": self.token} if self.token else {}
@@ -85,7 +109,7 @@ class BigIPClient:
             timeout=self.timeout,
         )
         response.raise_for_status()
-        return response.json()
+        return self._json_response(response, path)
 
     def run_bash(self, command: str, timeout: int) -> str:
         response = self.post(
@@ -132,8 +156,35 @@ def parse_xml(payload: str) -> ET.Element:
         return ET.fromstring(payload)
     except ET.ParseError as exc:
         raise RuntimeError(
-            "F5 Activation Service returned invalid XML."
+            "F5 Activation Service returned invalid XML. "
+            f"Response preview: {_response_preview(payload)}"
         ) from exc
+
+
+def _response_preview(payload: str, limit: int = 240) -> str:
+    preview = " ".join(payload.split())
+    preview = re.sub(
+        r"(?i)(password|registration[-_ ]?key|dossier|license)"
+        r"\s*[:=]\s*\S+",
+        r"\1=[redacted]",
+        preview,
+    )
+    return preview[:limit] + ("..." if len(preview) > limit else "")
+
+
+def _soap_fault_detail(payload: str) -> str:
+    try:
+        root = ET.fromstring(payload)
+    except ET.ParseError:
+        return ""
+    for element in root.iter():
+        if xml_name(element.tag) == "faultstring":
+            detail = " ".join(
+                part.strip() for part in element.itertext() if part.strip()
+            )
+            if detail:
+                return detail
+    return ""
 
 
 def _local_name(tag: str) -> str:
@@ -195,7 +246,24 @@ def soap_request(
         verify=verify_tls,
         timeout=timeout,
     )
-    response.raise_for_status()
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        content_type = response.headers.get("Content-Type", "unknown")
+        fault = _soap_fault_detail(response.text)
+        fault_text = f", fault={fault}" if fault else ""
+        raise RuntimeError(
+            "F5 Activation Service HTTP error: "
+            f"status={response.status_code}, content_type={content_type}, "
+            f"response={_response_preview(response.text)}{fault_text}"
+        ) from exc
+    content_type = response.headers.get("Content-Type", "unknown")
+    if not response.text.lstrip().startswith("<"):
+        raise RuntimeError(
+            "F5 Activation Service returned a non-XML response: "
+            f"status={response.status_code}, content_type={content_type}, "
+            f"response={_response_preview(response.text)}"
+        )
     return response.text
 
 
